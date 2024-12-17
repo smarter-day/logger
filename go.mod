@@ -1,6 +1,8 @@
 module github.com/smarter-day/logger
 
-go 1.22
+go 1.22.0
+
+toolchain go1.22.10
 
 require (
 	github.com/sirupsen/logrus v1.9.3

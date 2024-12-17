@@ -80,8 +80,8 @@ type Logger struct {
 }
 
 // SetLevel sets the global logging level.
-func (l *Logger) SetLevel(level Level) ILogger {
-	l.Entry.Logger.SetLevel(logrus.Level(level))
+func (l *Logger) SetLevel(level logrus.Level) ILogger {
+	l.Entry.Logger.SetLevel(level)
 	return l
 }
 

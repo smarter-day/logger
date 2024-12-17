@@ -1,5 +1,7 @@
 # Logger
 
+[![Go](https://github.com/smarter-day/logger/actions/workflows/go.yml/badge.svg)](https://github.com/smarter-day/logger/actions/workflows/go.yml)
+
  Logger is a Go-based logging library designed to provide structured and efficient logging capabilities. It leverages popular libraries like Logrus and OpenTelemetry to offer advanced logging features and tracing support.
 
 ## Table of Contents

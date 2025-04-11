@@ -2,167 +2,140 @@ package logger
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/getsentry/sentry-go"
+	"github.com/sirupsen/logrus"
 	"path/filepath"
 	"runtime"
 	"time"
-
-	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/otel/trace"
 )
 
+// Keys used in log fields.
 const (
 	ErrorKey          = "error"
 	SpanIdLogKeyName  = "spanID"
 	TraceIdLogKeyName = "traceID"
 )
 
-var logger ILogger
+// baseLogger is our global base logger configuration.
+var baseLogger *logrus.Logger
 
-// init initializes the logger configuration and sets up the global logger instance.
-// It configures Logrus to use JSON formatting with custom timestamp formatting.
-// Caller reporting is disabled to allow manual capture of caller information.
-// The logger instance is then assigned to the global logger variable.
+// init initializes a Logrus-based logger with JSON output, Debug level,
+// no built-in caller info (we add our own).
 func init() {
 	log := logrus.New()
-
-	// Configure Logrus formatter with JSON format and custom timestamp
 	log.SetFormatter(&logrus.JSONFormatter{
 		TimestampFormat: time.RFC3339Nano,
 	})
-
-	// Disable Logrus's built-in caller reporting
 	log.SetReportCaller(false)
-
-	// Set default log level
 	log.SetLevel(logrus.DebugLevel)
-
-	// Initialize the global logger with a base entry
-	logger = &Logger{
-		Entry: log.WithFields(logrus.Fields{}),
-	}
+	baseLogger = log
 }
 
-// Log returns a logger instance that is enriched with tracing information
-// if a valid context is provided.
-//
-// The function extracts the SpanContext from the given context and, if valid,
-// adds the span and trace IDs to the logger's context, allowing for enhanced
-// traceability in distributed systems.
-//
-// Parameters:
-//
-//	ctx - A context.Context from which the SpanContext is extracted. If the
-//	      context is nil or does not contain a valid SpanContext, the logger
-//	      is returned without additional trace information.
-//
-// Returns:
-//
-//	ILogger - A logger instance that may include span and trace IDs if the
-//	          provided context contains a valid SpanContext.
+// Log returns a logger instance potentially enriched with Sentry Trace and Span IDs
+// extracted from the context if a Sentry span is active.
 func Log(ctx context.Context) ILogger {
-	newLogger := logger
+	entry := logrus.NewEntry(baseLogger) // Start with a base entry for each call
+	fields := logrus.Fields{}
+
+	// Attempt to extract Sentry span context
 	if ctx != nil {
-		sc := trace.SpanContextFromContext(ctx)
-		if sc.IsValid() {
-			newLogger = newLogger.WithValues(
-				SpanIdLogKeyName, sc.SpanID().String(),
-				TraceIdLogKeyName, sc.TraceID().String(),
-			)
+		if span := sentry.SpanFromContext(getSentryContext(ctx)); span != nil {
+			traceID := span.TraceID.String()
+			spanID := span.SpanID.String()
+			if !isIdNull(traceID) && !isIdNull(spanID) {
+				fields[TraceIdLogKeyName] = traceID
+				fields[SpanIdLogKeyName] = spanID
+			}
 		}
 	}
-	return newLogger
+
+	// Return logger with potentially added Sentry fields
+	return &Logger{Entry: entry.WithFields(fields), Context: ctx}
 }
 
-// Logger implements the ILogger interface using Logrus.
+// Logger is a Logrus-based ILogger.
 type Logger struct {
-	Entry *logrus.Entry
+	Entry   *logrus.Entry
+	Context context.Context
 }
 
-// SetLevel sets the global logging level.
+// SetLevel sets the log level for the underlying logger instance.
 func (l *Logger) SetLevel(level logrus.Level) ILogger {
 	l.Entry.Logger.SetLevel(level)
 	return l
 }
 
-// Debug logs a message at the debug level with optional key-value pairs for additional context.
+// Debug logs a message at debug level with optional fields.
 func (l *Logger) Debug(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Debug(msg)
+	l.Entry.WithFields(l.convertToFields(keysAndValues...)).
+		WithField("caller", getCallerInfo()).
+		Debug(msg)
 }
 
-// Info logs a message at the info level with optional key-value pairs for additional context.
+// Info logs a message at info level with optional fields.
 func (l *Logger) Info(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Info(msg)
+	l.Entry.WithFields(l.convertToFields(keysAndValues...)).
+		WithField("caller", getCallerInfo()).
+		Info(msg)
 }
 
-// Warn logs a message at the warning level with optional key-value pairs for additional context.
+// Warn logs a message at warning level with optional fields.
 func (l *Logger) Warn(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Warn(msg)
+	l.Entry.WithFields(l.convertToFields(keysAndValues...)).
+		WithField("caller", getCallerInfo()).
+		Warn(msg)
 }
 
-// Error logs a message at the error level with optional key-value pairs for additional context.
+// Error logs a message at error level with optional fields.
+// Sentry capture should happen explicitly where the error is handled using the context-aware hub.
 func (l *Logger) Error(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Error(msg)
+	l.captureErrors(msg)
+	fields := l.convertToFields(keysAndValues...)
+	l.Entry.WithFields(fields).
+		WithField("caller", getCallerInfo()).
+		Error(msg)
 }
 
-// Fatal logs a message at the fatal level with optional key-value pairs for additional context.
-// It then exits the application with status code 1.
+// Fatal logs a message at fatal level, then exits.
 func (l *Logger) Fatal(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Fatal(msg)
+	l.captureErrors(msg)
+
+	fields := l.convertToFields(keysAndValues...)
+	l.Entry.WithFields(fields).
+		WithField("caller", getCallerInfo()).
+		Fatal(msg)
 }
 
-// Panic logs a message at the panic level with optional key-value pairs for additional context.
-// It then panics with the provided message.
+// Panic logs a message at panic level, then panics.
 func (l *Logger) Panic(msg string, keysAndValues ...interface{}) {
-	fields := convertToFields(keysAndValues...)
-	callerInfo := getCallerInfo()
-	l.Entry.WithFields(fields).WithFields(logrus.Fields{
-		"caller": callerInfo,
-	}).Panic(msg)
+	l.captureErrors(msg)
+
+	fields := l.convertToFields(keysAndValues...)
+	l.Entry.WithFields(fields).
+		WithField("caller", getCallerInfo()).
+		Panic(msg) // Note: Panic triggers a panic
 }
 
-// WithValues returns a new ILogger instance with additional context provided
-// by key-value pairs. These pairs are added to the logger's context, allowing
-// for more detailed and structured logging.
-func (l Logger) WithValues(keysAndValues ...interface{}) ILogger {
-	fields := convertToFields(keysAndValues...)
-	newEntry := l.Entry.WithFields(fields)
-	return &Logger{Entry: newEntry}
+// WithValues returns a new ILogger with additional fields added to the entry.
+func (l *Logger) WithValues(keysAndValues ...interface{}) ILogger {
+	fields := l.convertToFields(keysAndValues...)
+	return &Logger{Entry: l.Entry.WithFields(fields), Context: l.Context}
 }
 
-// WithError returns a new ILogger instance with an error context added.
-// This method enriches the logger's context with the provided error,
-// allowing for more detailed and structured logging of error information.
-func (l Logger) WithError(err error) ILogger {
-	newEntry := l.Entry.WithField(ErrorKey, err)
-	return &Logger{Entry: newEntry}
+// WithError returns a new ILogger that includes the given error in the log context.
+func (l *Logger) WithError(err error) ILogger {
+	return &Logger{Entry: l.Entry.WithField(ErrorKey, err), Context: l.Context}
 }
 
-// convertToFields converts variadic key-value pairs into logrus.Fields.
-// It ensures that keys are strings and handles any mismatches gracefully.
-func convertToFields(keysAndValues ...interface{}) logrus.Fields {
+// convertToFields turns key-value pairs into Logrus fields.
+func (l *Logger) convertToFields(keysAndValues ...interface{}) logrus.Fields {
 	fields := logrus.Fields{}
 	length := len(keysAndValues)
+	if length == 0 {
+		return fields
+	}
 	for i := 0; i < length-1; i += 2 {
 		key, ok := keysAndValues[i].(string)
 		if !ok {
@@ -170,7 +143,6 @@ func convertToFields(keysAndValues ...interface{}) logrus.Fields {
 		}
 		fields[key] = keysAndValues[i+1]
 	}
-	// Handle odd number of arguments
 	if length%2 != 0 {
 		key, ok := keysAndValues[length-1].(string)
 		if !ok {
@@ -181,24 +153,65 @@ func convertToFields(keysAndValues ...interface{}) logrus.Fields {
 	return fields
 }
 
-// getCallerInfo retrieves the file and function name of the caller outside the logger package.
-// It skips the frames related to the logger's internal methods.
+func (l *Logger) captureErrors(msg string) {
+	if l.Context == nil {
+		return
+	}
+
+	var hub *sentry.Hub
+	if h, ok := l.Context.Value(sentry.HubContextKey).(*sentry.Hub); ok {
+		hub = h
+	} else {
+		return
+	}
+
+	if msg != "" {
+		hub.CaptureException(errors.New(msg))
+	}
+
+	// Capture errors in fields
+	fields := l.Entry.Data
+	for _, value := range fields {
+		if err, isError := value.(error); isError {
+			hub.CaptureException(err)
+		}
+	}
+}
+
+// getCallerInfo returns file:line and function name for the calling code.
 func getCallerInfo() string {
-	// Number of stack frames to skip to reach the actual caller
 	const skipFrames = 3
 	pc, file, line, ok := runtime.Caller(skipFrames)
 	if !ok {
-		return "unknown"
+		return "unknown:?"
 	}
-
-	function := "unknown"
 	fn := runtime.FuncForPC(pc)
+	funcName := "unknown"
 	if fn != nil {
-		function = fn.Name()
+		funcName = filepath.Base(fn.Name())
 	}
-
-	// Shorten the file path to just the file name
-	shortFile := filepath.Base(file)
-
-	return fmt.Sprintf("%s:%d %s", shortFile, line, function)
+	return fmt.Sprintf("%s:%d %s", filepath.Base(file), line, funcName)
 }
+
+// isIdNull checks if a trace or span ID string is effectively null (empty or all zeros).
+func isIdNull(id string) bool {
+	if len(id) == 0 {
+		return true
+	}
+	for _, c := range id {
+		if c != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func getSentryContext(ctx context.Context) context.Context {
+	if sentryCtx, ok := ctx.Value(sentry.HubContextKey).(context.Context); ok {
+		return sentryCtx
+	}
+	return ctx
+}
+
+// Interface guard ensures Logger implements ILogger at compile time.
+var _ ILogger = (*Logger)(nil)
